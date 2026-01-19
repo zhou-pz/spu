@@ -59,8 +59,6 @@ TEST(OddEvenMergeTest, BasicCorrectness) {
     EXPECT_EQ(res_s.size(), 1);
     auto res = hal::dump_public_as<float>(&ctx, hal::reveal(&ctx, res_s[0]));
 
-    test::printProfileData(&ctx);
-
     if (lctx->Rank() == 0) {
       LOG(INFO) << "res_expected = \n" << res_expected;
       LOG(INFO) << "res  = \n" << res;

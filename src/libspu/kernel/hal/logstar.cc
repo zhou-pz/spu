@@ -236,4 +236,159 @@ std::pair<Value, Value> duplicate_brent_kung(SPUContext* ctx, const Value& x,
   return {x_out, valids_out};
 }
 
+// 支持多行 x 的 extract_ordered
+std::pair<std::vector<spu::Value>, int64_t> extract_ordered(
+    SPUContext* ctx, const spu::Value& arrs, const spu::Value& condition) {
+  // 兼容性处理：如果 x 不是 2D，就把它 reshape 成 2D（1 行）
+  spu::Value x = arrs;
+  if (x.shape().ndim() == 1) {
+    const int64_t n1 = x.numel();
+    x = hal::reshape(ctx, x, {1, n1});
+  } else if (x.shape().ndim() == 0) {
+    // scalar -> 1x1
+    x = hal::reshape(ctx, x, {1, 1});
+  }
+  SPU_ENFORCE(x.shape().ndim() == 2, "x should be 2D array");
+  SPU_ENFORCE(condition.shape().ndim() == 2 && condition.shape()[0] == 1,
+              "condition should be 1-row matrix");
+
+  const int64_t num_arrays = x.shape()[0];  // x行数
+  const int64_t n = x.shape()[1];           // x长度
+
+  SPU_ENFORCE(condition.shape()[1] == n,
+              "condition length must match x's second dimension");
+
+  // 1. 计算condition前缀和rho（保持一维）
+  auto rho = hal::associative_scan(hal::add, ctx, condition);
+  // 2. 将所有 x 的行分离出来，与 condition 一起洗牌
+  std::vector<spu::Value> inputs_to_shuffle;
+  inputs_to_shuffle.reserve(num_arrays + 2);
+  for (int64_t i = 0; i < num_arrays; ++i) {
+    auto x_row = hal::slice(ctx, x, {i, 0}, {i + 1, n}, {});
+    inputs_to_shuffle.push_back(x_row);
+  }
+  inputs_to_shuffle.push_back(condition);
+  inputs_to_shuffle.push_back(rho);
+
+  auto shuffled_results = hlo::Shuffle(ctx, inputs_to_shuffle, 1);
+
+  // 分离洗牌后的结果
+  std::vector<spu::Value> sx_rows(num_arrays);
+  for (int64_t i = 0; i < num_arrays; ++i) {
+    sx_rows[i] = shuffled_results[i];
+  }
+  auto scondition = shuffled_results[num_arrays];
+  auto srho = shuffled_results[num_arrays + 1];
+
+  // 3. 打开 scondition
+  auto scondition_open =
+      hal::dump_public_as<int64_t>(ctx, hal::reveal(ctx, scondition));
+
+  // 4. 计算公开置换 compact，使得 compact(scondition) = [1, 1, ..., 0, 0]
+  int64_t numel = scondition_open.size();
+  std::vector<int64_t> p_hat_indices(numel);
+
+  int64_t left = 0;
+  int64_t right = numel - 1;
+  for (int64_t i = 0; i < numel; ++i) {
+    if (scondition_open[i] != 0) {
+      p_hat_indices[left++] = i;  // valid放前面
+    } else {
+      p_hat_indices[right--] = i;  // dummy放后面
+    }
+  }
+  int64_t valid_count = left;
+
+  // 5. 用公开的 compact 置换 sx_rows 和 srho
+  auto p_hat_xt = xt::adapt(p_hat_indices);
+  spu::Value compact = hal::constant(
+      ctx, p_hat_xt, spu::DT_I64, {static_cast<int64_t>(p_hat_indices.size())});
+
+  std::vector<spu::Value> inputs_to_permute;
+  inputs_to_permute.reserve(sx_rows.size() + 1);
+  for (auto& sx_row : sx_rows) {
+    inputs_to_permute.push_back(sx_row);
+  }
+  inputs_to_permute.push_back(srho);
+
+  std::vector<spu::Value> compacted_results =
+      hlo::Permute(ctx, inputs_to_permute, compact, 1);
+
+  // 分离结果
+  std::vector<spu::Value> x_prime_rows(num_arrays);
+  for (int64_t i = 0; i < num_arrays; ++i) {
+    x_prime_rows[i] = compacted_results[i];
+  }
+  auto rho_prime = compacted_results[num_arrays];
+
+  // 6.
+  // rho_prime_processed = Open( rho_prime[0，valid_count] ) || [valid_count,n]
+  // rho_prime_processed 逆置换 x_prime_rows
+  xt::xarray<int64_t> rho_prime_processed;
+  if (valid_count > 0) {
+    auto rho_prime_slice =
+        hal::slice(ctx, rho_prime, {0, 0}, {1, valid_count}, {});
+    auto rho_prime_slice_open =
+        hal::dump_public_as<int64_t>(ctx, hal::reveal(ctx, rho_prime_slice));
+
+    rho_prime_slice_open = rho_prime_slice_open - 1;
+    auto flatted = xt::ravel(rho_prime_slice_open);
+    auto tail = xt::arange<int64_t>(valid_count, n);
+    rho_prime_processed = xt::concatenate(xt::xtuple(flatted, tail));
+  } else {
+    rho_prime_processed = xt::arange<int64_t>(n);
+  }
+  spu::Value rho_prime_constant =
+      hal::constant(ctx, rho_prime_processed, spu::DT_I64, {n});
+  std::vector<spu::Value> y =
+      hlo::InvPermute(ctx, x_prime_rows, rho_prime_constant, 1);
+
+  return {y, valid_count};
+}
+
+spu::Value LogstarRecursive(SPUContext* ctx, const spu::Value& x,
+                            const spu::Value& y) {
+  const int64_t nx = x.shape()[0];
+  const int64_t ny = y.shape()[0];
+  auto list_id_x = hal::seal(ctx, hal::constant(ctx, 0, DT_I1, {nx, 1}));
+  auto list_id_y = hal::seal(ctx, hal::constant(ctx, 1, DT_I1, {ny, 1}));
+
+  int64_t basic_size = 1;
+  if (nx <= basic_size) {
+    return x;
+  } else {
+    // ComputeMedians
+  }
+
+  return x;
+}
+
+spu::Value logstar(SPUContext* ctx, const spu::Value& key_x,
+                   const spu::Value& key_y) {
+  const int64_t nx = key_x.shape()[0];
+  const int64_t ny = key_y.shape()[0];
+  auto dtayp = key_x.dtype();
+  auto valid_x = hal::seal(ctx, hal::constant(ctx, 1, dtayp, {nx, 1}));
+  auto valid_y = hal::seal(ctx, hal::constant(ctx, 1, dtayp, {ny, 1}));
+  // xt::xarray<int64_t> x_iota = xt::arange<int64_t>(nx);
+  // auto idx_x = hal::seal(ctx, hal::constant(ctx, x_iota, dtayp, {nx, 1}));
+  // xt::xarray<int64_t> y_iota = xt::arange<int64_t>(nx, nx + ny);
+  // auto idx_y = hal::seal(ctx, hal::constant(ctx, y_iota, dtayp, {ny, 1}));
+
+  auto x = hal::concatenate(ctx, {reshape(ctx, key_x, {nx, 1}), valid_x}, 1);
+  auto y = hal::concatenate(ctx, {reshape(ctx, key_y, {ny, 1}), valid_y}, 1);
+
+  if (ctx->lctx()->Rank() == 0) {
+    std::cout << "x.shape(): " << x.shape() << std::endl;
+  }
+
+  return LogstarRecursive(ctx, x, y);
+
+  // hal::dump_public_as<float>(ctx, hal::reveal(ctx, list_id_x));
+  // auto c_idx_x = hal::dump_public_as<float>(ctx, hal::reveal(ctx, idx_y));
+  // if (ctx->lctx()->Rank() == 0) {
+  //   std::cout << "c_idx_x: " << c_idx_x << std::endl;
+  // }
+}
+
 }  // namespace spu::kernel::hal
