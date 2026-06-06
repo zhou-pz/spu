@@ -78,7 +78,7 @@ TEST(OddEvenMergeTest, LargeScaleRealNumbers) {
   const auto field = FieldType::FM64;
 
   const int num_groups = 1;
-  int input_size = 524288;
+  int input_size = 5000000;
   int total_size = input_size * 2;
   std::mt19937 rng(std::random_device{}());
   std::uniform_int_distribution<int> size_dist(1, input_size);

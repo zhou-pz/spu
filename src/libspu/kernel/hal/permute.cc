@@ -660,8 +660,7 @@ std::vector<MergeLayer> gen_odd_even_merge_layers(
 //   const int64_t N =
 //       ndim == 2 ? keys.front().shape()[1] : keys.front().shape()[0];
 
-//   // 核心修复：如果输入是 2D，先将它们全部展平为 1D，以满足 linear_gather
-//   // 的严格校验
+//   // Core fix: flatten 2D inputs to 1D to satisfy linear_gather's strict shape check
 //   if (ndim == 2) {
 //     for (auto &v : ret) {
 //       v = hal::reshape(ctx, v, {B * N});
@@ -682,7 +681,7 @@ std::vector<MergeLayer> gen_odd_even_merge_layers(
 //     batched_lhs.reserve(layer.lhs.size() * B);
 //     batched_rhs.reserve(layer.rhs.size() * B);
 
-//     // 将 1D 的比较索引广播到所有的 Batch 上
+//     // Broadcast 1D comparison indices across all batches
 //     for (int64_t b = 0; b < B; ++b) {
 //       int64_t offset = b * N;
 //       for (size_t i = 0; i < layer.lhs.size(); ++i) {
@@ -704,7 +703,7 @@ std::vector<MergeLayer> gen_odd_even_merge_layers(
 //     }
 //   }
 
-//   // 核心修复：处理完成后，将 1D 张量恢复为原始的 2D 形状
+//   // Core fix: restore 1D tensors to original 2D shape after processing
 //   if (ndim == 2) {
 //     for (auto &v : ret) {
 //       v = hal::reshape(ctx, v, {B, N});
@@ -714,7 +713,7 @@ std::vector<MergeLayer> gen_odd_even_merge_layers(
 //   return ret;
 // }
 
-// 支持多维pyload
+// Supports multi-dimensional payloads
 std::vector<spu::Value> odd_even_merge(SPUContext *ctx,
                                        absl::Span<spu::Value const> keys,
                                        int64_t split_idx,
@@ -726,9 +725,9 @@ std::vector<spu::Value> odd_even_merge(SPUContext *ctx,
       key_ndim == 2 ? keys.front().shape()[1] : keys.front().shape()[0];
 
   std::vector<spu::Value> flat_ret;
-  std::vector<int64_t> payload_E;  // 记录每个输入在额外维度上的元素总数
+  std::vector<int64_t> payload_E;  // number of extra-dimension elements per input (1 for keys/scalar payloads)
 
-  // 1. 自动展开 (Auto-Unstack): 将所有多维 Payload 展平并切片为 1D 张量
+  // 1. Auto-unstack: flatten all multi-dimensional payloads into 1D slices
   for (size_t i = 0; i < keys.size(); ++i) {
     auto input = keys[i];
     spu::Value casted;
@@ -740,12 +739,12 @@ std::vector<spu::Value> odd_even_merge(SPUContext *ctx,
     casted = _prefer_a(ctx, casted);
 
     if (i == 0) {
-      // Key 必须是 1D [N] 或 2D [B, N]
+      // Key must be 1D [N] or batched 2D [B, N]
       casted = hal::reshape(ctx, casted, {B * N});
       flat_ret.push_back(casted);
       payload_E.push_back(1);
     } else {
-      // Payload 可以是 [B, N, d1, d2, ...]
+      // Payload may have extra trailing dims: [B, N, d1, d2, ...]
       int64_t E = 1;
       for (int64_t d = key_ndim; d < input.shape().ndim(); ++d) {
         E *= input.shape()[d];
@@ -756,7 +755,7 @@ std::vector<spu::Value> odd_even_merge(SPUContext *ctx,
         casted = hal::reshape(ctx, casted, {B * N});
         flat_ret.push_back(casted);
       } else {
-        // 将 Payload 展平为 [B * N, E]，然后切片成 E 个 [B * N] 的 1D 张量
+        // Flatten to [B*N, E] then slice into E separate 1D tensors of length B*N
         casted = hal::reshape(ctx, casted, {B * N, E});
         for (int64_t e = 0; e < E; ++e) {
           auto slice_e = hal::slice(ctx, casted, {0, e}, {B * N, e + 1}, {});
@@ -767,7 +766,7 @@ std::vector<spu::Value> odd_even_merge(SPUContext *ctx,
     }
   }
 
-  // 2. 生成比较网络并执行 _cmp_swap
+  // 2. Build the odd-even merge network and execute _cmp_swap
   spu::Index left_indices(split_idx);
   std::iota(left_indices.begin(), left_indices.end(), 0);
   spu::Index right_indices(N - split_idx);
@@ -802,7 +801,7 @@ std::vector<spu::Value> odd_even_merge(SPUContext *ctx,
     }
   }
 
-  // 3. 自动重组 (Auto-Stack): 将 1D 张量恢复为原始的多维形状
+  // 3. Auto-stack: reshape 1D tensors back to their original multi-dimensional shapes
   std::vector<spu::Value> ret;
   size_t flat_idx = 0;
   for (size_t i = 0; i < keys.size(); ++i) {
@@ -2125,7 +2124,7 @@ std::vector<spu::Value> radix_sort(SPUContext *ctx,
 //                                 is_stable) {
 //   // sanity check.
 //   SPU_ENFORCE(!keys.empty(), "Keys should not be empty");
-//   // 放宽维度检查，允许 1D 或 2D
+//   // Relax dimension check to allow 1D or 2D keys
 //   SPU_ENFORCE(keys[0].shape().ndim() == 1 || keys[0].shape().ndim() == 2,
 //               "Keys should be 1-d or 2-d but actually have {} dimensions",
 //               keys[0].shape().ndim());
@@ -2150,7 +2149,7 @@ std::vector<spu::Value> radix_sort(SPUContext *ctx,
 //   return ret;
 // }
 
-// 支持多维payload
+// Supports multi-dimensional payloads
 std::vector<spu::Value> merge1d(SPUContext *ctx,
                                 absl::Span<spu::Value const> keys,
                                 const bool with_payloads, int64_t split_idx,
@@ -2164,7 +2163,7 @@ std::vector<spu::Value> merge1d(SPUContext *ctx,
               "Keys should be 1-d or 2-d but actually have {} dimensions",
               key_ndim);
 
-  // 放宽校验：Payload 的前缀维度必须与 Key 匹配，但允许有额外的维度
+  // Payloads must share the same prefix dimensions as the key; trailing dims are allowed
   SPU_ENFORCE(std::all_of(keys.begin(), keys.end(),
                           [&](const spu::Value &v) {
                             if (v.shape().ndim() < key_ndim) return false;

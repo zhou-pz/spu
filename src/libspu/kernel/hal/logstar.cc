@@ -329,7 +329,7 @@ std::pair<std::vector<spu::Value>, int64_t> extract_ordered(
   }
   auto rho_prime = compacted_results[num_arrays];
 
-  // rho_prime_processed = Open( rho_prime[0，valid_count] ) || [valid_count,n]
+  // rho_prime_processed = Open( rho_prime[0, valid_count] ) || [valid_count, n]
   // Inversely permute x_prime_rows using rho_prime_processed
   xt::xarray<int64_t> rho_prime_processed;
   if (valid_count > 0) {
@@ -402,15 +402,12 @@ spu::Value ComputeMedians(SPUContext* ctx, SortDirection direction,
   return z;
 }
 
-static thread_local int call_count = 0;
-
 spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
                             const spu::Value& x_in, const spu::Value& y_in) {
   const int64_t batch_size = x_in.shape()[0];
   const int64_t nx = x_in.shape()[1];
   const int64_t ny = y_in.shape()[1];
   const int64_t n_attr = x_in.shape()[2];
-  ++call_count;
 
   // Reset opposite list_id for x and y
   auto dtayp = x_in.dtype();
@@ -447,8 +444,8 @@ spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
   const int k_y = (ny + m - 1) / m;
 
   // pad x and y to make its length a multiple of m
-  spu::Value x_pad = x;
-  spu::Value y_pad = y;
+  spu::Value x_pad = x.clone();
+  spu::Value y_pad = y.clone();
   if (nx % m != 0) {
     int64_t padding_len = k_x * m - nx;
     auto max_key = hal::slice(ctx, x, {0, nx - 1, 0}, {batch_size, nx, 1}, {});
@@ -512,87 +509,23 @@ spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
     auto keys = hal::concatenate(ctx, {median_x, median_y}, 1);
     const int64_t K = k_x + k_y;
 
-    // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    // CompositeKey = (Keys << iota_bits) + iota
+    auto iota_bits = static_cast<int64_t>(std::ceil(std::log2(K)) + 1);
+    if (iota_bits == 0) {
+      iota_bits = 1;
+    }
 
-    // CompositeKey = Keys * K + iota（只支持整数）
-    xt::xarray<float> iota_arr = xt::arange<float>(K);
-    auto iota = hal::constant(ctx, iota_arr, keys.dtype(), {batch_size, K});
-    if (keys.isSecret()) iota = hal::seal(ctx, iota);
+    spu::Sizes shift_amount = {iota_bits};
+    // auto keys_i64 = hal::bitcast(ctx, keys, spu::DT_I64);
+    auto shifted_keys = hal::left_shift(ctx, keys, shift_amount);
 
-    auto K_val = hal::constant(ctx, static_cast<float>(K), keys.dtype(),
-                               {batch_size, K});
-    if (keys.isSecret()) K_val = hal::seal(ctx, K_val);
+    xt::xarray<int64_t> iota_arr = xt::arange<int64_t>(K);
+    auto iota_val = hal::constant(ctx, iota_arr, spu::DT_I64, {batch_size, K});
 
-    auto scaled_keys = hal::mul(ctx, keys, K_val);
-    auto composite_keys = hal::add(ctx, scaled_keys, iota);
+    auto composite_keys =
+        _add(ctx, shifted_keys, iota_val).setDtype(spu::DT_I64);
 
-    // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-    // // CompositeKey = (Keys << iota_bits) + bitcast(iota)
-    // //（MPC的概率截断会导致出错）
-    // int64_t iota_bits = static_cast<int64_t>(std::ceil(std::log2(K)) + 1);
-    // if (iota_bits == 0) iota_bits = 1;
-
-    // spu::Sizes shift_amount = {iota_bits};
-    // auto shifted_keys = hal::left_shift(ctx, keys, shift_amount);
-
-    // xt::xarray<int64_t> iota_arr = xt::arange<int64_t>(K);
-    // auto iota_val = hal::constant(ctx, iota_arr, spu::DT_I64, {batch_size,
-    // K});
-
-    // if (keys.isSecret()) {
-    //   iota_val = hal::seal(ctx, iota_val);
-    // }
-
-    // auto iota_aligned = hal::bitcast(ctx, iota_val, keys.dtype());
-    // auto composite_keys = hal::add(ctx, shifted_keys, iota_aligned);
-
-    // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-    // // CompositeKey = Keys * 2^iota_bits + iota / 2^f_bits
-    // //（MPC的概率截断会导致出错）
-    // int64_t iota_bits = static_cast<int64_t>(std::ceil(std::log2(K)));
-    // if (iota_bits == 0) iota_bits = 1;
-
-    // auto multiplier = static_cast<float>(1ULL << iota_bits);
-    // auto multiplier_val =
-    //     hal::constant(ctx, multiplier, keys.dtype(), {batch_size, K});
-    // if (keys.isSecret()) multiplier_val = hal::seal(ctx, multiplier_val);
-    // auto multiplied_keys = hal::mul(ctx, keys, multiplier_val);
-
-    // auto revealed1 = hal::dump_public_as<float>(ctx, hal::reveal(ctx, keys));
-    // auto revealed2 =
-    //     hal::dump_public_as<float>(ctx, hal::reveal(ctx, multiplied_keys));
-    // if (ctx->lctx()->Rank() == 0) {
-    //   std::cout << "keys: " << revealed1 << std::endl;
-    //   std::cout << "multiplied_keys: " << revealed2 << std::endl;
-    // }
-
-    // int64_t f_bits = ctx->config().fxp_fraction_bits;
-    // float denominator = std::exp2(static_cast<float>(f_bits));  // 2^f_bits
-
-    // xt::xarray<float> iota_arr = xt::arange<float>(K);
-    // iota_arr = iota_arr / denominator;
-
-    // auto iota_val = hal::constant(ctx, iota_arr, keys.dtype(), {batch_size,
-    // K}); if (keys.isSecret()) iota_val = hal::seal(ctx, iota_val);
-
-    // auto revealed5 =
-    //     hal::dump_public_as<float>(ctx, hal::reveal(ctx, iota_val));
-    // if (ctx->lctx()->Rank() == 0) {
-    //   std::cout << "iota_val: " << revealed5 << std::endl;
-    // }
-
-    // auto composite_keys = hal::add(ctx, multiplied_keys, iota_val);
-    // auto revealed4 =
-    //     hal::dump_public_as<float>(ctx, hal::reveal(ctx, composite_keys));
-    // if (ctx->lctx()->Rank() == 0) {
-    //   std::cout << std::fixed << std::setprecision(18);
-    //   std::cout << "composite_keys: " << revealed4 << std::endl;
-    // }
-
-    // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
+    // Merge by medians
     auto payloads = hal::concatenate(ctx, {reshaped_x, reshaped_y}, 1);
     std::vector<spu::Value> merge_inputs = {composite_keys, keys, payloads};
 
@@ -602,17 +535,6 @@ spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
 
     auto merged_blocks = merged_results[2];  // B
     auto merged_medians = merged_results[1];
-
-    // auto revealed5 =
-    //     hal::dump_public_as<float>(ctx, hal::reveal(ctx, merged_medians));
-    // if (ctx->lctx()->Rank() == 0) {
-    //   std::cout << "merged_medians: " << revealed5 << std::endl;
-    // }
-    // auto revealed6 =
-    //     hal::dump_public_as<float>(ctx, hal::reveal(ctx, merged_blocks));
-    // if (ctx->lctx()->Rank() == 0) {
-    //   std::cout << "merged_blocks: " << revealed6 << std::endl;
-    // }
 
     // merged_blocks shape: [batch_size, K, m, n_attr]
     auto list_ids =
@@ -636,11 +558,6 @@ spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
         ctx, hal::constant(ctx, 0.0F, list_ids.dtype(), {batch_size, 1}));
     auto c = hal::concatenate(ctx, {c_0, c_rest}, 1);
 
-    // auto revealed_c = hal::dump_public_as<float>(ctx, hal::reveal(ctx, c));
-    // if (ctx->lctx()->Rank() == 0) {
-    //   std::cout << "transition flag c: " << revealed_c << std::endl;
-    // }
-
     // 2.g. Duplicate blocks using Brent-Kung network
     auto B_shifted = hal::slice(ctx, merged_blocks, {0, 0, 0, 0},
                                 {batch_size, K - 1, m, n_attr}, {});
@@ -651,7 +568,9 @@ spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
 
     auto ones_id =
         hal::constant(ctx, 1.0F, merged_blocks.dtype(), {batch_size, 1, 1, 1});
-    if (merged_blocks.isSecret()) ones_id = hal::seal(ctx, ones_id);
+    if (merged_blocks.isSecret()) {
+      ones_id = hal::seal(ctx, ones_id);
+    }
     auto opposite_id = hal::sub(ctx, ones_id, first_list_id);
 
     auto dummy_list_id =
@@ -659,14 +578,17 @@ spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
 
     auto dummy_attr01 =
         hal::constant(ctx, 0.0F, merged_blocks.dtype(), {batch_size, 1, m, 2});
-    if (merged_blocks.isSecret()) dummy_attr01 = hal::seal(ctx, dummy_attr01);
+    if (merged_blocks.isSecret()) {
+      dummy_attr01 = hal::seal(ctx, dummy_attr01);
+    }
 
     spu::Value dummy_block;
     if (n_attr > 3) {
       auto dummy_attr_rest = hal::constant(ctx, 0.0F, merged_blocks.dtype(),
                                            {batch_size, 1, m, n_attr - 3});
-      if (merged_blocks.isSecret())
+      if (merged_blocks.isSecret()) {
         dummy_attr_rest = hal::seal(ctx, dummy_attr_rest);
+      }
       dummy_block = hal::concatenate(
           ctx, {dummy_attr01, dummy_list_id, dummy_attr_rest}, 3);
     } else {
@@ -676,11 +598,6 @@ spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
     // B_input_to_tree = [dummy_block, B_0, B_1, ..., B_{K-2}]
     auto B_input_to_tree = hal::concatenate(ctx, {dummy_block, B_shifted}, 1);
     auto S = duplicate_brent_kung(ctx, B_input_to_tree, c);
-
-    // auto revealed_S_ = hal::dump_public_as<float>(ctx, hal::reveal(ctx, S));
-    // if (ctx->lctx()->Rank() == 0) {
-    //   std::cout << "duplicated blocks S: " << revealed_S_ << std::endl;
-    // }
 
     // 2.h. Update IsReal for B (merged_blocks) and S
     auto B_key = hal::reshape(
@@ -754,20 +671,11 @@ spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
         hal::reshape(ctx, new_S_valid, {batch_size, K, m, 1});
     S = hal::concatenate(ctx, {S_attr0, new_S_valid_reshaped, S_attr2}, 3);
 
-    // auto revealed_B =
-    //     hal::dump_public_as<float>(ctx, hal::reveal(ctx, merged_blocks));
-    // auto revealed_S = hal::dump_public_as<float>(ctx, hal::reveal(ctx, S));
-    // if (ctx->lctx()->Rank() == 0) {
-    //   std::cout << "merged_blocks.shape: " << merged_blocks.shape()
-    //             << std::endl;
-    //   std::cout << "processed blocks B: " << revealed_B << std::endl;
-    //   std::cout << "processed blocks S: " << revealed_S << std::endl;
-    // }
-
     // 2.i. parallel-for i \in [2k]: [[I_i]] := LogstarRecursive([[S_i]],
     // [[B_i]])
     auto S_flat = hal::reshape(ctx, S, {batch_size * K, m, n_attr});
     auto B_flat = hal::reshape(ctx, merged_blocks, {batch_size * K, m, n_attr});
+
     auto I_flat = LogstarRecursive(ctx, direction, S_flat, B_flat);
 
     const int64_t L = I_flat.shape()[1];
@@ -777,6 +685,20 @@ spu::Value LogstarRecursive(SPUContext* ctx, SortDirection direction,
   }
 }
 
+/**
+ * @brief Merge two sorted secret-shared arrays into a single sorted array.
+ *
+ * Implements the Logstar merge algorithm: recursively partitions each input
+ * into blocks of size m ≈ log(n), merges the block medians, propagates
+ * opposite-list blocks via a Brent-Kung parallel-prefix duplication, then
+ * recurses on each (block, shadow) pair.  Recursion depth is O(log*(n)).
+ *
+ * @param ctx     Runtime context.
+ * @param direction  Ascending or Descending sort order.
+ * @param key_x   Sorted 1-D key array from list X, shape [nx].
+ * @param key_y   Sorted 1-D key array from list Y, shape [ny].
+ * @return Merged sorted 1-D array of length nx + ny.
+ */
 spu::Value logstar(SPUContext* ctx, SortDirection direction,
                    const spu::Value& key_x, const spu::Value& key_y) {
   const int64_t nx = key_x.shape()[0];
@@ -794,12 +716,8 @@ spu::Value logstar(SPUContext* ctx, SortDirection direction,
 
   auto I = LogstarRecursive(ctx, direction, x, y);
 
-  if (ctx->lctx()->Rank() == 0) {
-    std::cout << "Number of recursive calls: " << call_count - 1 << std::endl;
-  }
-
-  const int64_t B = I.shape()[0];          // batch_size (通常為 1)
-  const int64_t total_len = I.shape()[1];  // 包含 Dummy 的總長度
+  const int64_t B = I.shape()[0];  // batch_size
+  const int64_t total_len = I.shape()[1];
   SPU_ENFORCE(
       B == 1,
       "batchsize of the outermost recursion must be 1, but it is now: {}", B);
